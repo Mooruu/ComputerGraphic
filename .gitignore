@@ -1,0 +1,50 @@
+# Visual Studio files and directories
+.vs/
+*.suo
+*.user
+*.ncb
+*.aps
+*.opendb
+*.opensdf
+*.sdf
+*.cachefile
+*.VC.db
+*.VC.opendb
+ipch/
+
+# Build artifacts
+Debug/
+Release/
+x64/
+Win32/
+bin/
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.idb
+*.tlog
+*.lastbuildstate
+*.log
+*.res
+*.pch
+*.exp
+*.map
+
+# CMake-related files (if using CMake)
+CMakeLists.txt.user
+CMakeCache.txt
+CMakeFiles/
+_deps/
+build/
+out/ # Common directory for CMake builds
+
+# Other temporary files
+*.~
+*.bak
+*.tmp
+
+# User-specific settings and preferences
+*.resharper
+*.dotSettings
