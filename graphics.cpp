@@ -220,4 +220,4 @@ void triangle_phong_tex(Vec3f* pts, Vec2f* uvs, Vec3f* norms, Vec3f* worldPos,
             }
         }
     }
-}8
+}

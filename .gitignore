@@ -48,3 +48,5 @@ out/ # Common directory for CMake builds
 # User-specific settings and preferences
 *.resharper
 *.dotSettings
+graphics.cpp
+output копия.tga
