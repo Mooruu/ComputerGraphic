@@ -1,0 +1,17 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="main.cpp" />
+    <ClCompile Include="..\Common\d3dApp.cpp" />
+    <ClCompile Include="..\Common\d3dUtil.cpp" />
+    <ClCompile Include="..\Common\GameTimer.cpp" />
+    <ClCompile Include="..\Common\MathHelper.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\Common\d3dApp.h" />
+    <ClInclude Include="..\Common\d3dUtil.h" />
+    <ClInclude Include="..\Common\GameTimer.h" />
+    <ClInclude Include="..\Common\MathHelper.h" />
+    <ClInclude Include="..\Common\UploadBuffer.h" />
+  </ItemGroup>
+</Project>
