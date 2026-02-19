@@ -3,6 +3,7 @@
 #include <iostream>
 #include <algorithm>
 #include <limits>
+
 #include "graphics.h"
 #include "tgaimage.h"
 #include "model.h"
@@ -12,6 +13,23 @@ Vec3f light_dir(0, 0, -1);
 Vec3f camera(1, 0, 4);
 Vec3f center(0, 0, 0);
 Vec3f up(0, 1, 0);
+
+float s = 0.95f;
+
+Vec3f C[8] = {
+  {-s,-s,-s}, { s,-s,-s}, { s, s,-s}, {-s, s,-s},
+  {-s,-s, s}, { s,-s, s}, { s, s, s}, {-s, s, s}
+};
+
+int F[12][3] = {
+  {0,1,2},{0,2,3},
+  {4,6,5},{4,7,6},
+  {0,4,5},{0,5,1},
+  {3,2,6},{3,6,7},
+  {0,3,7},{0,7,4},
+  {1,5,6},{1,6,2} 
+};
+
 
 static Vec3f m2v(Matrix m) {
     return Vec3f(
@@ -48,6 +66,8 @@ int main(int argc, char** argv) {
     }
 
     Viewport = viewport(0, 0, width, height);
+
+
     lookat(camera, center, up);
 
     Projection = Matrix::identity(4);
@@ -57,6 +77,7 @@ int main(int argc, char** argv) {
     Projection[3][2] = -1.f / dist;
 
     TGAImage image(width, height, TGAImage::RGB);
+
     bool use_tex = model->has_diffuse();
 
     for (int i = 0; i < model->nfaces(); i++) {
@@ -91,6 +112,7 @@ int main(int argc, char** argv) {
                 uvs[0] = model->uv(i, 0);
                 uvs[1] = model->uv(i, k);
                 uvs[2] = model->uv(i, k + 1);
+
                 triangle_phong_tex(pts, uvs, norms, wpos, image, zbuffer, light_dir, camera);
             }
             else {
@@ -98,6 +120,20 @@ int main(int argc, char** argv) {
             }
         }
     }
+
+    TGAColor glass(180, 220, 255, 255);
+    float alpha = 0.15f;
+
+    for (int t = 0; t < 12; t++) {
+        Vec3f pts[3];
+        for (int k = 0; k < 3; k++) {
+            Vec3f v = C[F[t][k]];
+            Vec3f sv = m2v((Viewport * Projection * ModelView) * v2m(v));
+            pts[k] = sv;
+        }
+        triangle_alpha(pts, image, glass, alpha, zbuffer);
+    }
+
 
     image.flip_vertically();
     image.write_tga_file("output.tga");

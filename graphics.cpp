@@ -19,6 +19,8 @@ static const float ambientStrength = 0.30f;
 static const float diffuseStrength = 0.70f;
 static const float specularStrength = 0.20f;
 
+
+
 static inline float clamp01(float x) {
     return std::max(0.f, std::min(1.f, x));
 }
@@ -217,6 +219,49 @@ void triangle_phong_tex(Vec3f* pts, Vec2f* uvs, Vec3f* norms, Vec3f* worldPos,
                 Vec3f fragPos = worldPos[0] * bc.x + worldPos[1] * bc.y + worldPos[2] * bc.z;
 
                 image.set(P.x, P.y, phongColor(N, fragPos, light_dir, eyePos, albedo));
+            }
+        }
+    }
+}
+static inline unsigned char clamp_u8(int x) {
+    if (x < 0) return 0;
+    if (x > 255) return 255;
+    return (unsigned char)x;
+}
+
+static inline TGAColor alpha_blend(const TGAColor& dst, const TGAColor& src, float a) {
+    int r = (int)(src.r * a + dst.r * (1.f - a));
+    int g = (int)(src.g * a + dst.g * (1.f - a));
+    int b = (int)(src.b * a + dst.b * (1.f - a));
+    return TGAColor(clamp_u8(b), clamp_u8(g), clamp_u8(r), 255);
+}
+
+void triangle_alpha(Vec3f* pts, TGAImage& image, TGAColor src, float alpha, float* zb) {
+    Vec2i bboxmin(width - 1, height - 1);
+    Vec2i bboxmax(0, 0);
+    Vec2i clamp(width - 1, height - 1);
+
+    for (int i = 0; i < 3; i++) {
+        bboxmin.x = std::max(0, std::min(bboxmin.x, (int)pts[i].x));
+        bboxmin.y = std::max(0, std::min(bboxmin.y, (int)pts[i].y));
+        bboxmax.x = std::min(clamp.x, std::max(bboxmax.x, (int)pts[i].x));
+        bboxmax.y = std::min(clamp.y, std::max(bboxmax.y, (int)pts[i].y));
+    }
+
+    Vec2i P;
+    for (P.x = bboxmin.x; P.x <= bboxmax.x; P.x++) {
+        for (P.y = bboxmin.y; P.y <= bboxmax.y; P.y++) {
+            Vec3f bc = barycentric(pts, P);
+            if (bc.x < 0.f || bc.y < 0.f || bc.z < 0.f) continue;
+
+            float z = pts[0].z * bc.x + pts[1].z * bc.y + pts[2].z * bc.z;
+            int idx = P.x + P.y * width;
+            if (idx < 0 || idx >= width * height) continue;
+            if (z > zb[idx]) {
+                TGAColor dst = image.get(P.x, P.y);
+                TGAColor out = alpha_blend(dst, src, alpha);
+                image.set(P.x, P.y, out);
+
             }
         }
     }
