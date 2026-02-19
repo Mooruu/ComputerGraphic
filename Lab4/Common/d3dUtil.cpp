@@ -87,29 +87,38 @@ Microsoft::WRL::ComPtr<ID3D12Resource> d3dUtil::CreateDefaultBuffer(
 }
 
 ComPtr<ID3DBlob> d3dUtil::CompileShader(
-	const std::wstring& filename,
-	const D3D_SHADER_MACRO* defines,
-	const std::string& entrypoint,
-	const std::string& target)
+    const std::wstring& filename,
+    const D3D_SHADER_MACRO* defines,
+    const std::string& entrypoint,
+    const std::string& target)
 {
-	UINT compileFlags = 0;
+    UINT compileFlags = 0;
 #if defined(DEBUG) || defined(_DEBUG)  
-	compileFlags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+    compileFlags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
 #endif
 
-	HRESULT hr = S_OK;
+    ComPtr<ID3DBlob> byteCode = nullptr;
+    ComPtr<ID3DBlob> errors;
+    HRESULT hr = D3DCompileFromFile(filename.c_str(), defines, D3D_COMPILE_STANDARD_FILE_INCLUDE,
+        entrypoint.c_str(), target.c_str(), compileFlags, 0, &byteCode, &errors);
 
-	ComPtr<ID3DBlob> byteCode = nullptr;
-	ComPtr<ID3DBlob> errors;
-	hr = D3DCompileFromFile(filename.c_str(), defines, D3D_COMPILE_STANDARD_FILE_INCLUDE,
-		entrypoint.c_str(), target.c_str(), compileFlags, 0, &byteCode, &errors);
+    if (errors != nullptr)
+    {
+        // Выводим ошибку компиляции
+        OutputDebugStringA("Shader compilation error:\n");
+        OutputDebugStringA((char*)errors->GetBufferPointer());
+        OutputDebugStringA("\n");
+    }
 
-	if(errors != nullptr)
-		OutputDebugStringA((char*)errors->GetBufferPointer());
+    if (FAILED(hr))
+    {
+        // Создаём сообщение с путём к файлу
+        std::string msg = "Failed to compile shader: " + std::string(filename.begin(), filename.end());
+        MessageBoxA(nullptr, msg.c_str(), "Shader Error", MB_OK);
+    }
 
-	ThrowIfFailed(hr);
-
-	return byteCode;
+    ThrowIfFailed(hr);
+    return byteCode;
 }
 
 std::wstring DxException::ToString()const
