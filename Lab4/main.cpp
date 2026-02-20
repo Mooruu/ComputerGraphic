@@ -282,6 +282,10 @@ void SponzaApp::BuildRootSignature()
         serializedRootSig->GetBufferSize(),
         IID_PPV_ARGS(&mRootSignature)));
 }
+    
+
+
+
 
 void SponzaApp::BuildShadersAndInputLayout()
 {
