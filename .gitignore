@@ -1,0 +1,34 @@
+# Visual Studio user and workspace files
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.VC.opendb
+ipch/
+
+# Visual C++ build output and intermediate files
+[Dd]ebug/
+[Rr]elease/
+[Xx]64/
+[Xx]86/
+*.tlog
+*.idb
+*.ilk
+*.pdb
+*.log
+*.recipe
+*.lastbuildstate
+*.Build.CppClean.log
+
+# Generated shader binaries
+*.cso
+
+# Do not ignore *.obj: this project keeps the source Sponza OBJ model in Models/.
+
+# Legacy nested project and duplicate resource copies.
+CGLab4/
+/textures/
+/sponza.obj
+/sponza.mtl
