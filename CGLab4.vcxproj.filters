@@ -10,6 +10,7 @@
     <ClCompile Include="Common\MathHelper.cpp" />
     <ClCompile Include="Culling.cpp" />
     <ClCompile Include="ShadowMap.cpp" />
+    <ClCompile Include="ParticleSystem.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="Model.cpp" />
   </ItemGroup>
@@ -25,6 +26,7 @@
     <ClInclude Include="Common\UploadBuffer.h" />
     <ClInclude Include="Culling.h" />
     <ClInclude Include="ShadowMap.h" />
+    <ClInclude Include="ParticleSystem.h" />
     <ClInclude Include="Model.h" />
     <ClInclude Include="tiny_obj_loader.h" />
   </ItemGroup>
