@@ -29,6 +29,7 @@
     <ClCompile Include="Culling.cpp" />
     <ClCompile Include="ShadowMap.cpp" />
     <ClCompile Include="ParticleSystem.cpp" />
+    <ClCompile Include="SceneColor.cpp" />
     <ClCompile Include="GBuffer.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="Model.cpp" />
@@ -47,6 +48,7 @@
     <ClInclude Include="Culling.h" />
     <ClInclude Include="ShadowMap.h" />
     <ClInclude Include="ParticleSystem.h" />
+    <ClInclude Include="SceneColor.h" />
     <ClInclude Include="GBuffer.h" />
     <ClInclude Include="Model.h" />
     <ClInclude Include="RenderingSystem.h" />

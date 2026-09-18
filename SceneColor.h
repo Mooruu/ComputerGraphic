@@ -1,0 +1,3 @@
+#pragma once
+#include "Common/d3dUtil.h"
+class SceneColor { public: static constexpr DXGI_FORMAT Format=DXGI_FORMAT_R16G16B16A16_FLOAT; void Build(ID3D12Device* d,UINT w,UINT h); void CreateDescriptors(ID3D12Device* d,D3D12_CPU_DESCRIPTOR_HANDLE c,D3D12_GPU_DESCRIPTOR_HANDLE g); void Transition(ID3D12GraphicsCommandList* l,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b)const; D3D12_CPU_DESCRIPTOR_HANDLE Rtv()const{return mRtvHeap->GetCPUDescriptorHandleForHeapStart();} D3D12_GPU_DESCRIPTOR_HANDLE Srv()const{return mSrv;} private: Microsoft::WRL::ComPtr<ID3D12Resource> mTex; Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> mRtvHeap; D3D12_GPU_DESCRIPTOR_HANDLE mSrv={};};
