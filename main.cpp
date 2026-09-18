@@ -3,7 +3,9 @@
 #include "Common/UploadBuffer.h"
 #include "Common/Camera.h"
 #include "Common/DDSTextureLoader.h"
+#include "GBuffer.h"
 #include "Model.h"
+#include "RenderingSystem.h"
 
 #include <wincodec.h>
 #include <array>
@@ -386,6 +388,7 @@ private:
     void BuildShadersAndInputLayout();
     void BuildModel();
     void BuildTextures();
+    void BuildGBuffer();
     void BuildPSO();
 
 private:
@@ -394,14 +397,24 @@ private:
     UINT mCbvSrvUavDescriptorSize = 0;
 
     std::unique_ptr<UploadBuffer<ObjectConstants>> mObjectCB = nullptr;
+    std::unique_ptr<UploadBuffer<DeferredLightConstants>> mLightCB = nullptr;
     std::unique_ptr<Model> mSponza = nullptr;
     std::unique_ptr<MeshGeometry> mSponzaGeo = nullptr;
     std::vector<Texture> mTextures;
+    GBuffer mGBuffer;
+    RenderingSystem mRenderingSystem;
+    UINT mGBufferSrvStart = 0;
+    bool mDeferredReady = false;
 
     ComPtr<ID3DBlob> mvsByteCode = nullptr;
     ComPtr<ID3DBlob> mpsByteCode = nullptr;
+    ComPtr<ID3DBlob> mGBufferVS = nullptr;
+    ComPtr<ID3DBlob> mGBufferPS = nullptr;
+    ComPtr<ID3DBlob> mLightingVS = nullptr;
+    ComPtr<ID3DBlob> mLightingPS = nullptr;
     std::vector<D3D12_INPUT_ELEMENT_DESC> mInputLayout;
     ComPtr<ID3D12PipelineState> mPSO = nullptr;
+    ComPtr<ID3D12PipelineState> mLightingPSO = nullptr;
 
     XMFLOAT4X4 mWorld = MathHelper::Identity4x4();
 
@@ -437,7 +450,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance, PSTR cmdLine, in
 
 SponzaApp::SponzaApp(HINSTANCE hInstance) : D3DApp(hInstance)
 {
-    mMainWndCaption = L"Sponza Demo - Keys: 1/2 Tiling +/-, 3/4 Scroll X +/-, 5/6 Scroll Y +/-, 0 Reset";
+    mMainWndCaption = L"Sponza Deferred - WASD move, Q/E up/down, mouse look, 1-6 texture controls";
     mClientWidth = 1280;
     mClientHeight = 720;
 
@@ -469,6 +482,7 @@ bool SponzaApp::Initialize()
     BuildDescriptorHeaps();
     BuildConstantBuffers();
     BuildTextures();
+    BuildGBuffer();
     BuildPSO();
 
     ThrowIfFailed(mCommandList->Close());
@@ -483,20 +497,13 @@ void SponzaApp::OnResize()
 {
     D3DApp::OnResize();
     mCamera.SetLens(0.25f * MathHelper::Pi, AspectRatio(), 1.0f, 100000.0f);
+    if (mDeferredReady)
+        BuildGBuffer();
 }
 
 void SponzaApp::Update(const GameTimer& gt)
 {
     OnKeyboardInput(gt);
-
-    float x = mRadius * sinf(mPhi) * cosf(mTheta);
-    float z = mRadius * sinf(mPhi) * sinf(mTheta);
-    float y = mRadius * cosf(mPhi);
-
-    XMFLOAT3 pos(x, y, z);
-    XMFLOAT3 target(0.0f, 3.0f, 0.0f);
-
-    mCamera.LookAt(pos, target, XMFLOAT3(0.0f, 1.0f, 0.0f));
     mCamera.UpdateViewMatrix();
 
     XMMATRIX world = XMLoadFloat4x4(&mWorld);
@@ -518,12 +525,12 @@ void SponzaApp::Draw(const GameTimer& gt)
     mCommandList->RSSetViewports(1, &mScreenViewport);
     mCommandList->RSSetScissorRects(1, &mScissorRect);
 
-    mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(CurrentBackBuffer(),
-        D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
-
-    mCommandList->ClearRenderTargetView(CurrentBackBufferView(), Colors::LightSteelBlue, 0, nullptr);
+    mGBuffer.Transition(mCommandList.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    D3D12_CPU_DESCRIPTOR_HANDLE gbufferRtvs[GBuffer::TargetCount] = { mGBuffer.Rtv(0), mGBuffer.Rtv(1), mGBuffer.Rtv(2) };
+    for (UINT i = 0; i < GBuffer::TargetCount; ++i)
+        mCommandList->ClearRenderTargetView(gbufferRtvs[i], Colors::Black, 0, nullptr);
     mCommandList->ClearDepthStencilView(DepthStencilView(), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
-    mCommandList->OMSetRenderTargets(1, &CurrentBackBufferView(), true, &DepthStencilView());
+    mCommandList->OMSetRenderTargets(GBuffer::TargetCount, gbufferRtvs, false, &DepthStencilView());
 
     ID3D12DescriptorHeap* descriptorHeaps[] = { mCbvHeap.Get() };
     mCommandList->SetDescriptorHeaps(_countof(descriptorHeaps), descriptorHeaps);
@@ -598,6 +605,18 @@ void SponzaApp::Draw(const GameTimer& gt)
         }
     }
 
+    mGBuffer.Transition(mCommandList.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(CurrentBackBuffer(),
+        D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
+    mCommandList->OMSetRenderTargets(1, &CurrentBackBufferView(), true, nullptr);
+    mCommandList->ClearRenderTargetView(CurrentBackBufferView(), Colors::Black, 0, nullptr);
+    mCommandList->SetPipelineState(mLightingPSO.Get());
+    mCommandList->SetGraphicsRootDescriptorTable(3, mGBuffer.SrvTable());
+    const auto lights = mRenderingSystem.BuildLightConstants(mCamera.GetPosition3f());
+    mLightCB->CopyData(0, lights);
+    mCommandList->SetGraphicsRootConstantBufferView(4, mLightCB->Resource()->GetGPUVirtualAddress());
+    mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    mCommandList->DrawInstanced(3, 1, 0, 0);
     mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(CurrentBackBuffer(),
         D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT));
 
@@ -629,17 +648,8 @@ void SponzaApp::OnMouseMove(WPARAM btnState, int x, int y)
     {
         float dx = XMConvertToRadians(0.5f * static_cast<float>(x - mLastMousePos.x));
         float dy = XMConvertToRadians(0.5f * static_cast<float>(y - mLastMousePos.y));
-
-        mTheta += dx;
-        mPhi += dy;
-        mPhi = MathHelper::Clamp(mPhi, 0.1f, MathHelper::Pi - 0.1f);
-    }
-    else if ((btnState & MK_RBUTTON) != 0)
-    {
-        float dx = 0.01f * static_cast<float>(x - mLastMousePos.x);
-        float dy = 0.01f * static_cast<float>(y - mLastMousePos.y);
-        mRadius += dx - dy;
-        mRadius = MathHelper::Clamp(mRadius, 5.0f, 100.0f);
+        mCamera.Pitch(dy);
+        mCamera.RotateY(dx);
     }
 
     mLastMousePos.x = x;
@@ -648,8 +658,19 @@ void SponzaApp::OnMouseMove(WPARAM btnState, int x, int y)
 
 void SponzaApp::OnKeyboardInput(const GameTimer& gt)
 {
-    if (!mSponza)
-        return;
+    const float speed = (GetAsyncKeyState(VK_SHIFT) & 0x8000 ? 80.0f : 30.0f) * gt.DeltaTime();
+    if (GetAsyncKeyState('W') & 0x8000) mCamera.Walk(speed);
+    if (GetAsyncKeyState('S') & 0x8000) mCamera.Walk(-speed);
+    if (GetAsyncKeyState('A') & 0x8000) mCamera.Strafe(-speed);
+    if (GetAsyncKeyState('D') & 0x8000) mCamera.Strafe(speed);
+    if (GetAsyncKeyState('Q') & 0x8000 || GetAsyncKeyState('E') & 0x8000)
+    {
+        auto position = mCamera.GetPosition3f();
+        position.y += (GetAsyncKeyState('E') & 0x8000 ? speed : -speed);
+        mCamera.SetPosition(position);
+    }
+
+    if (!mSponza) return;
 
     auto& materials = const_cast<std::vector<ModelMaterial>&>(mSponza->GetMaterials());
 
@@ -724,7 +745,7 @@ void SponzaApp::BuildDescriptorHeaps()
         : 1;
 
     D3D12_DESCRIPTOR_HEAP_DESC cbvSrvHeapDesc = {};
-    cbvSrvHeapDesc.NumDescriptors = 1 + materialCount; // 1 CBV + one SRV per material.
+    cbvSrvHeapDesc.NumDescriptors = 1 + materialCount + GBuffer::TargetCount;
     cbvSrvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     cbvSrvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     cbvSrvHeapDesc.NodeMask = 0;
@@ -736,6 +757,7 @@ void SponzaApp::BuildDescriptorHeaps()
 void SponzaApp::BuildConstantBuffers()
 {
     mObjectCB = std::make_unique<UploadBuffer<ObjectConstants>>(md3dDevice.Get(), 1, true);
+    mLightCB = std::make_unique<UploadBuffer<DeferredLightConstants>>(md3dDevice.Get(), 1, true);
     D3D12_GPU_VIRTUAL_ADDRESS cbAddress = mObjectCB->Resource()->GetGPUVirtualAddress();
 
     D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
@@ -746,7 +768,7 @@ void SponzaApp::BuildConstantBuffers()
 
 void SponzaApp::BuildRootSignature()
 {
-    CD3DX12_ROOT_PARAMETER slotRootParameter[3];
+    CD3DX12_ROOT_PARAMETER slotRootParameter[5];
 
     CD3DX12_DESCRIPTOR_RANGE cbvTable;
     cbvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0);
@@ -762,6 +784,11 @@ void SponzaApp::BuildRootSignature()
         0,
         D3D12_SHADER_VISIBILITY_ALL);
 
+    CD3DX12_DESCRIPTOR_RANGE gbufferTable;
+    gbufferTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, GBuffer::TargetCount, 1);
+    slotRootParameter[3].InitAsDescriptorTable(1, &gbufferTable, D3D12_SHADER_VISIBILITY_PIXEL);
+    slotRootParameter[4].InitAsConstantBufferView(2, 0, D3D12_SHADER_VISIBILITY_PIXEL);
+
     CD3DX12_STATIC_SAMPLER_DESC linearWrapSampler(
         0,
         D3D12_FILTER_MIN_MAG_MIP_LINEAR,
@@ -770,7 +797,7 @@ void SponzaApp::BuildRootSignature()
         D3D12_TEXTURE_ADDRESS_MODE_WRAP);
 
     CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(
-        3,
+        5,
         slotRootParameter,
         1,
         &linearWrapSampler,
@@ -805,6 +832,10 @@ void SponzaApp::BuildShadersAndInputLayout()
 
     OutputDebugString(L"Compiling PS with entrypoint 'PS'...\n");
     mpsByteCode = d3dUtil::CompileShader(shaderPath, nullptr, "PS", "ps_5_0");
+    mGBufferVS = d3dUtil::CompileShader(L"Shaders\\gbuffer.hlsl", nullptr, "VS", "vs_5_0");
+    mGBufferPS = d3dUtil::CompileShader(L"Shaders\\gbuffer.hlsl", nullptr, "PS", "ps_5_0");
+    mLightingVS = d3dUtil::CompileShader(L"Shaders\\deferred_lighting.hlsl", nullptr, "VS", "vs_5_0");
+    mLightingPS = d3dUtil::CompileShader(L"Shaders\\deferred_lighting.hlsl", nullptr, "PS", "ps_5_0");
 
     OutputDebugString(L"Shaders compiled successfully!\n");
 
@@ -919,25 +950,51 @@ void SponzaApp::BuildTextures()
     OutputDebugStringA("=== TEXTURE LOADING COMPLETE ===\n");
 }
 
+void SponzaApp::BuildGBuffer()
+{
+    mGBuffer.Build(md3dDevice.Get(), mClientWidth, mClientHeight);
+    const UINT materialCount = static_cast<UINT>(mSponza->GetMaterials().size());
+    mGBufferSrvStart = 1 + materialCount;
+    CD3DX12_CPU_DESCRIPTOR_HANDLE cpu(mCbvHeap->GetCPUDescriptorHandleForHeapStart());
+    cpu.Offset(mGBufferSrvStart, mCbvSrvUavDescriptorSize);
+    CD3DX12_GPU_DESCRIPTOR_HANDLE gpu(mCbvHeap->GetGPUDescriptorHandleForHeapStart());
+    gpu.Offset(mGBufferSrvStart, mCbvSrvUavDescriptorSize);
+    mGBuffer.CreateDescriptors(md3dDevice.Get(), cpu, gpu, mCbvSrvUavDescriptorSize);
+    mDeferredReady = true;
+}
+
 void SponzaApp::BuildPSO()
 {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
     psoDesc.InputLayout = { mInputLayout.data(), (UINT)mInputLayout.size() };
     psoDesc.pRootSignature = mRootSignature.Get();
-    psoDesc.VS = { reinterpret_cast<BYTE*>(mvsByteCode->GetBufferPointer()), mvsByteCode->GetBufferSize() };
-    psoDesc.PS = { reinterpret_cast<BYTE*>(mpsByteCode->GetBufferPointer()), mpsByteCode->GetBufferSize() };
+    psoDesc.VS = { reinterpret_cast<BYTE*>(mGBufferVS->GetBufferPointer()), mGBufferVS->GetBufferSize() };
+    psoDesc.PS = { reinterpret_cast<BYTE*>(mGBufferPS->GetBufferPointer()), mGBufferPS->GetBufferSize() };
     psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
     psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
     psoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
     psoDesc.SampleMask = UINT_MAX;
     psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    psoDesc.NumRenderTargets = 1;
-    psoDesc.RTVFormats[0] = mBackBufferFormat;
+    psoDesc.NumRenderTargets = GBuffer::TargetCount;
+    for (UINT i = 0; i < GBuffer::TargetCount; ++i) psoDesc.RTVFormats[i] = GBuffer::Format(i);
     psoDesc.SampleDesc.Count = m4xMsaaState ? 4 : 1;
     psoDesc.SampleDesc.Quality = m4xMsaaState ? (m4xMsaaQuality - 1) : 0;
     psoDesc.DSVFormat = mDepthStencilFormat;
 
     ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&mPSO)));
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC lightingDesc = psoDesc;
+    lightingDesc.InputLayout = { nullptr, 0 };
+    lightingDesc.VS = { reinterpret_cast<BYTE*>(mLightingVS->GetBufferPointer()), mLightingVS->GetBufferSize() };
+    lightingDesc.PS = { reinterpret_cast<BYTE*>(mLightingPS->GetBufferPointer()), mLightingPS->GetBufferSize() };
+    lightingDesc.NumRenderTargets = 1;
+    lightingDesc.RTVFormats[0] = mBackBufferFormat;
+    for (UINT i = 1; i < _countof(lightingDesc.RTVFormats); ++i)
+        lightingDesc.RTVFormats[i] = DXGI_FORMAT_UNKNOWN;
+    lightingDesc.DepthStencilState.DepthEnable = FALSE;
+    lightingDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    lightingDesc.DSVFormat = DXGI_FORMAT_UNKNOWN;
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&lightingDesc, IID_PPV_ARGS(&mLightingPSO)));
 }
 
 void SponzaApp::ConfigureMaterialAnimations()
