@@ -9,6 +9,7 @@
     <ClCompile Include="Common\GeometryGenerator.cpp" />
     <ClCompile Include="Common\MathHelper.cpp" />
     <ClCompile Include="Culling.cpp" />
+    <ClCompile Include="ShadowMap.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="Model.cpp" />
   </ItemGroup>
@@ -23,6 +24,7 @@
     <ClInclude Include="Common\MathHelper.h" />
     <ClInclude Include="Common\UploadBuffer.h" />
     <ClInclude Include="Culling.h" />
+    <ClInclude Include="ShadowMap.h" />
     <ClInclude Include="Model.h" />
     <ClInclude Include="tiny_obj_loader.h" />
   </ItemGroup>

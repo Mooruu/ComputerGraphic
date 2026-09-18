@@ -12,6 +12,8 @@ struct DeferredLightConstants
     DirectX::XMFLOAT4 SpotPositionRange;
     DirectX::XMFLOAT4 SpotDirectionPower;
     DirectX::XMFLOAT4 SpotColor;
+    DirectX::XMFLOAT4X4 ShadowTransform[3];
+    DirectX::XMFLOAT4 CascadeSplits;
 };
 
 class RenderingSystem

@@ -5,6 +5,7 @@
 #include "Common/DDSTextureLoader.h"
 #include "Common/GeometryGenerator.h"
 #include "Culling.h"
+#include "ShadowMap.h"
 #include "GBuffer.h"
 #include "Model.h"
 #include "RenderingSystem.h"
@@ -13,6 +14,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <cfloat>
 #include <fstream>
 #include <random>
 
@@ -44,6 +46,17 @@ struct InstanceData
 {
     DirectX::XMFLOAT4X4 World = MathHelper::Identity4x4();
     DirectX::XMFLOAT4 Color = { 1.0f, 1.0f, 1.0f, 1.0f };
+};
+
+struct ShadowPassConstants
+{
+    DirectX::XMFLOAT4X4 LightViewProj = MathHelper::Identity4x4();
+};
+
+struct CascadedShadowConstants
+{
+    DirectX::XMFLOAT4X4 ShadowTransform[ShadowMap::CascadeCount];
+    DirectX::XMFLOAT4 CascadeSplits = { 0, 0, 0, 0 };
 };
 
 namespace
@@ -399,10 +412,13 @@ private:
     void BuildModel();
     void BuildTextures();
     void BuildGBuffer();
+    void BuildShadowMap();
     void BuildPSO();
     void BuildInstancedScene();
     void UpdateVisibleInstances();
     void UpdateCullingMode();
+    void UpdateShadowTransforms();
+    void DrawShadowMap();
 
 private:
     ComPtr<ID3D12RootSignature> mRootSignature = nullptr;
@@ -412,6 +428,7 @@ private:
     std::unique_ptr<UploadBuffer<ObjectConstants>> mObjectCB = nullptr;
     std::unique_ptr<UploadBuffer<DeferredLightConstants>> mLightCB = nullptr;
     std::unique_ptr<UploadBuffer<InstanceData>> mInstanceBuffer = nullptr;
+    std::unique_ptr<UploadBuffer<ShadowPassConstants>> mShadowPassCB = nullptr;
     std::unique_ptr<Model> mSponza = nullptr;
     std::unique_ptr<MeshGeometry> mSponzaGeo = nullptr;
     std::vector<Texture> mTextures;
@@ -424,8 +441,10 @@ private:
     bool mFrustumCullingEnabled = true;
     bool mUseOctree = true;
     GBuffer mGBuffer;
+    ShadowMap mShadowMap;
     RenderingSystem mRenderingSystem;
     UINT mGBufferSrvStart = 0;
+    UINT mShadowSrvStart = 0;
     bool mDeferredReady = false;
 
     ComPtr<ID3DBlob> mvsByteCode = nullptr;
@@ -438,11 +457,17 @@ private:
     ComPtr<ID3DBlob> mLightingPS = nullptr;
     ComPtr<ID3DBlob> mInstanceVS = nullptr;
     ComPtr<ID3DBlob> mInstancePS = nullptr;
+    ComPtr<ID3DBlob> mShadowVS = nullptr;
+    ComPtr<ID3DBlob> mShadowInstanceVS = nullptr;
     std::vector<D3D12_INPUT_ELEMENT_DESC> mInputLayout;
     std::vector<D3D12_INPUT_ELEMENT_DESC> mInstanceInputLayout;
     ComPtr<ID3D12PipelineState> mPSO = nullptr;
     ComPtr<ID3D12PipelineState> mLightingPSO = nullptr;
     ComPtr<ID3D12PipelineState> mInstancePSO = nullptr;
+    ComPtr<ID3D12PipelineState> mShadowPSO = nullptr;
+    ComPtr<ID3D12PipelineState> mShadowInstancePSO = nullptr;
+
+    CascadedShadowConstants mCascadedShadowConstants;
 
     XMFLOAT4X4 mWorld = MathHelper::Identity4x4();
 
@@ -512,6 +537,7 @@ bool SponzaApp::Initialize()
     BuildConstantBuffers();
     BuildTextures();
     BuildGBuffer();
+    BuildShadowMap();
     BuildPSO();
 
     ThrowIfFailed(mCommandList->Close());
@@ -536,6 +562,7 @@ void SponzaApp::Update(const GameTimer& gt)
     mCamera.UpdateViewMatrix();
     UpdateCullingMode();
     UpdateVisibleInstances();
+    UpdateShadowTransforms();
 
     XMMATRIX world = XMLoadFloat4x4(&mWorld);
     XMMATRIX view = mCamera.GetView();
@@ -555,6 +582,8 @@ void SponzaApp::Draw(const GameTimer& gt)
     ThrowIfFailed(mDirectCmdListAlloc->Reset());
     ThrowIfFailed(mCommandList->Reset(mDirectCmdListAlloc.Get(), mPSO.Get()));
 
+    DrawShadowMap();
+    mCommandList->SetPipelineState(mPSO.Get());
     mCommandList->RSSetViewports(1, &mScreenViewport);
     mCommandList->RSSetScissorRects(1, &mScissorRect);
 
@@ -669,7 +698,11 @@ void SponzaApp::Draw(const GameTimer& gt)
     mCommandList->ClearRenderTargetView(CurrentBackBufferView(), Colors::Black, 0, nullptr);
     mCommandList->SetPipelineState(mLightingPSO.Get());
     mCommandList->SetGraphicsRootDescriptorTable(3, mGBuffer.SrvTable());
-    const auto lights = mRenderingSystem.BuildLightConstants(mCamera.GetPosition3f());
+    mCommandList->SetGraphicsRootDescriptorTable(5, mShadowMap.Srv());
+    auto lights = mRenderingSystem.BuildLightConstants(mCamera.GetPosition3f());
+    for (UINT i = 0; i < ShadowMap::CascadeCount; ++i)
+        lights.ShadowTransform[i] = mCascadedShadowConstants.ShadowTransform[i];
+    lights.CascadeSplits = mCascadedShadowConstants.CascadeSplits;
     mLightCB->CopyData(0, lights);
     mCommandList->SetGraphicsRootConstantBufferView(4, mLightCB->Resource()->GetGPUVirtualAddress());
     mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -802,7 +835,7 @@ void SponzaApp::BuildDescriptorHeaps()
         : 1;
 
     D3D12_DESCRIPTOR_HEAP_DESC cbvSrvHeapDesc = {};
-    cbvSrvHeapDesc.NumDescriptors = 1 + materialCount * 3 + GBuffer::TargetCount;
+    cbvSrvHeapDesc.NumDescriptors = 1 + materialCount * 3 + GBuffer::TargetCount + 1;
     cbvSrvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     cbvSrvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     cbvSrvHeapDesc.NodeMask = 0;
@@ -815,6 +848,7 @@ void SponzaApp::BuildConstantBuffers()
 {
     mObjectCB = std::make_unique<UploadBuffer<ObjectConstants>>(md3dDevice.Get(), 1, true);
     mLightCB = std::make_unique<UploadBuffer<DeferredLightConstants>>(md3dDevice.Get(), 1, true);
+    mShadowPassCB = std::make_unique<UploadBuffer<ShadowPassConstants>>(md3dDevice.Get(), ShadowMap::CascadeCount, true);
     D3D12_GPU_VIRTUAL_ADDRESS cbAddress = mObjectCB->Resource()->GetGPUVirtualAddress();
 
     D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
@@ -825,7 +859,7 @@ void SponzaApp::BuildConstantBuffers()
 
 void SponzaApp::BuildRootSignature()
 {
-    CD3DX12_ROOT_PARAMETER slotRootParameter[5];
+    CD3DX12_ROOT_PARAMETER slotRootParameter[7];
 
     CD3DX12_DESCRIPTOR_RANGE cbvTable;
     cbvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0);
@@ -849,6 +883,11 @@ void SponzaApp::BuildRootSignature()
     slotRootParameter[3].InitAsDescriptorTable(1, &gbufferTable, D3D12_SHADER_VISIBILITY_PIXEL);
     slotRootParameter[4].InitAsConstantBufferView(2, 0, D3D12_SHADER_VISIBILITY_PIXEL);
 
+    CD3DX12_DESCRIPTOR_RANGE shadowTable;
+    shadowTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 6);
+    slotRootParameter[5].InitAsDescriptorTable(1, &shadowTable, D3D12_SHADER_VISIBILITY_PIXEL);
+    slotRootParameter[6].InitAsConstantBufferView(3, 0, D3D12_SHADER_VISIBILITY_VERTEX);
+
     CD3DX12_STATIC_SAMPLER_DESC linearWrapSampler(
         0,
         D3D12_FILTER_MIN_MAG_MIP_LINEAR,
@@ -856,11 +895,23 @@ void SponzaApp::BuildRootSignature()
         D3D12_TEXTURE_ADDRESS_MODE_WRAP,
         D3D12_TEXTURE_ADDRESS_MODE_WRAP);
 
-    CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(
-        5,
-        slotRootParameter,
+    CD3DX12_STATIC_SAMPLER_DESC shadowSampler(
         1,
-        &linearWrapSampler,
+        D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT,
+        D3D12_TEXTURE_ADDRESS_MODE_BORDER,
+        D3D12_TEXTURE_ADDRESS_MODE_BORDER,
+        D3D12_TEXTURE_ADDRESS_MODE_BORDER,
+        0.0f,
+        16,
+        D3D12_COMPARISON_FUNC_LESS_EQUAL,
+        D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE);
+
+    CD3DX12_STATIC_SAMPLER_DESC samplers[] = { linearWrapSampler, shadowSampler };
+    CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(
+        7,
+        slotRootParameter,
+        _countof(samplers),
+        samplers,
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
 
     ComPtr<ID3DBlob> serializedRootSig = nullptr;
@@ -910,6 +961,8 @@ void SponzaApp::BuildShadersAndInputLayout()
         L"..\\..\\Shaders\\instances.hlsl",
         L"instances.hlsl"
     });
+    const std::wstring shadowPath = FindExistingFileW({ L"Shaders\\shadow.hlsl", L"..\\Shaders\\shadow.hlsl", L"..\\..\\Shaders\\shadow.hlsl", L"shadow.hlsl" });
+    const std::wstring shadowInstancePath = FindExistingFileW({ L"Shaders\\shadow_instances.hlsl", L"..\\Shaders\\shadow_instances.hlsl", L"..\\..\\Shaders\\shadow_instances.hlsl", L"shadow_instances.hlsl" });
 
     mGBufferVS = d3dUtil::CompileShader(gbufferPath, nullptr, "VS", "vs_5_0");
     mGBufferPS = d3dUtil::CompileShader(gbufferPath, nullptr, "PS", "ps_5_0");
@@ -919,6 +972,8 @@ void SponzaApp::BuildShadersAndInputLayout()
     mLightingPS = d3dUtil::CompileShader(lightingPath, nullptr, "PS", "ps_5_0");
     mInstanceVS = d3dUtil::CompileShader(instancePath, nullptr, "VS", "vs_5_0");
     mInstancePS = d3dUtil::CompileShader(instancePath, nullptr, "PS", "ps_5_0");
+    mShadowVS = d3dUtil::CompileShader(shadowPath, nullptr, "VS", "vs_5_0");
+    mShadowInstanceVS = d3dUtil::CompileShader(shadowInstancePath, nullptr, "VS", "vs_5_0");
 
     OutputDebugString(L"Shaders compiled successfully!\n");
 
@@ -1065,6 +1120,110 @@ void SponzaApp::UpdateVisibleInstances()
         mInstanceBuffer->CopyData(i, mInstances[mVisibleInstanceIndices[i]]);
 }
 
+void SponzaApp::UpdateShadowTransforms()
+{
+    constexpr float shadowNear = 1.0f;
+    constexpr float shadowFar = 180.0f;
+    constexpr float lambda = 0.78f;
+    float cascadeNear = shadowNear;
+    const XMFLOAT3 cameraPosition = mCamera.GetPosition3f();
+    const XMVECTOR position = XMLoadFloat3(&cameraPosition);
+    const XMVECTOR look = XMVector3Normalize(mCamera.GetLook());
+    const XMVECTOR right = XMVector3Normalize(mCamera.GetRight());
+    const XMVECTOR up = XMVector3Normalize(mCamera.GetUp());
+    const XMVECTOR lightDirection = XMVector3Normalize(XMVectorSet(-0.35f, -0.8f, 0.25f, 0.0f));
+    const XMMATRIX textureTransform = XMMatrixScaling(0.5f, -0.5f, 1.0f) * XMMatrixTranslation(0.5f, 0.5f, 0.0f);
+
+    for (UINT cascade = 0; cascade < ShadowMap::CascadeCount; ++cascade)
+    {
+        const float p = static_cast<float>(cascade + 1) / ShadowMap::CascadeCount;
+        const float logarithmic = shadowNear * powf(shadowFar / shadowNear, p);
+        const float uniform = shadowNear + (shadowFar - shadowNear) * p;
+        const float cascadeFar = lambda * logarithmic + (1.0f - lambda) * uniform;
+
+        XMVECTOR corners[8];
+        UINT cornerIndex = 0;
+        for (float distance : { cascadeNear, cascadeFar })
+        {
+            const float halfHeight = tanf(0.5f * mCamera.GetFovY()) * distance;
+            const float halfWidth = halfHeight * mCamera.GetAspect();
+            const XMVECTOR center = position + look * distance;
+            corners[cornerIndex++] = center - right * halfWidth - up * halfHeight;
+            corners[cornerIndex++] = center - right * halfWidth + up * halfHeight;
+            corners[cornerIndex++] = center + right * halfWidth - up * halfHeight;
+            corners[cornerIndex++] = center + right * halfWidth + up * halfHeight;
+        }
+
+        XMVECTOR center = XMVectorZero();
+        for (const auto& corner : corners) center += corner;
+        center /= 8.0f;
+        const XMMATRIX lightView = XMMatrixLookAtLH(center - lightDirection * 220.0f, center, XMVectorSet(0, 1, 0, 0));
+        XMFLOAT3 minPoint(FLT_MAX, FLT_MAX, FLT_MAX);
+        XMFLOAT3 maxPoint(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+        for (const auto& corner : corners)
+        {
+            XMFLOAT3 point;
+            XMStoreFloat3(&point, XMVector3TransformCoord(corner, lightView));
+            minPoint.x = (std::min)(minPoint.x, point.x); minPoint.y = (std::min)(minPoint.y, point.y); minPoint.z = (std::min)(minPoint.z, point.z);
+            maxPoint.x = (std::max)(maxPoint.x, point.x); maxPoint.y = (std::max)(maxPoint.y, point.y); maxPoint.z = (std::max)(maxPoint.z, point.z);
+        }
+        const XMMATRIX lightProj = XMMatrixOrthographicOffCenterLH(minPoint.x, maxPoint.x, minPoint.y, maxPoint.y,
+            minPoint.z - 80.0f, maxPoint.z + 80.0f);
+        const XMMATRIX lightViewProj = lightView * lightProj;
+        XMStoreFloat4x4(&mCascadedShadowConstants.ShadowTransform[cascade], XMMatrixTranspose(lightViewProj * textureTransform));
+        ShadowPassConstants shadowPass;
+        XMStoreFloat4x4(&shadowPass.LightViewProj, XMMatrixTranspose(lightViewProj));
+        mShadowPassCB->CopyData(cascade, shadowPass);
+        (&mCascadedShadowConstants.CascadeSplits.x)[cascade] = cascadeFar;
+        cascadeNear = cascadeFar;
+    }
+}
+
+void SponzaApp::DrawShadowMap()
+{
+    mShadowMap.Transition(mCommandList.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    const D3D12_VIEWPORT viewport = mShadowMap.Viewport();
+    const D3D12_RECT scissor = mShadowMap.ScissorRect();
+    mCommandList->RSSetViewports(1, &viewport);
+    mCommandList->RSSetScissorRects(1, &scissor);
+    mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
+
+    for (UINT cascade = 0; cascade < ShadowMap::CascadeCount; ++cascade)
+    {
+        const D3D12_CPU_DESCRIPTOR_HANDLE dsv = mShadowMap.Dsv(cascade);
+        mCommandList->OMSetRenderTargets(0, nullptr, false, &dsv);
+        mCommandList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        mCommandList->SetGraphicsRootConstantBufferView(6,
+            mShadowPassCB->Resource()->GetGPUVirtualAddress() + cascade * d3dUtil::CalcConstantBufferByteSize(sizeof(ShadowPassConstants)));
+
+        if (mSponzaGeo && mSponza)
+        {
+            mCommandList->SetPipelineState(mShadowPSO.Get());
+            mCommandList->IASetVertexBuffers(0, 1, &mSponzaGeo->VertexBufferView());
+            mCommandList->IASetIndexBuffer(&mSponzaGeo->IndexBufferView());
+            mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            for (size_t i = 0; i < mSponza->GetMeshes().size(); ++i)
+            {
+                const auto& submesh = mSponzaGeo->DrawArgs.at(std::to_string(i));
+                mCommandList->DrawIndexedInstanced(submesh.IndexCount, 1, submesh.StartIndexLocation, submesh.BaseVertexLocation, 0);
+            }
+        }
+
+        if (mInstanceGeo && mInstanceBuffer && mVisibleInstanceCount > 0)
+        {
+            mCommandList->SetPipelineState(mShadowInstancePSO.Get());
+            const D3D12_VERTEX_BUFFER_VIEW instanceBufferView = { mInstanceBuffer->Resource()->GetGPUVirtualAddress(), mVisibleInstanceCount * static_cast<UINT>(sizeof(InstanceData)), static_cast<UINT>(sizeof(InstanceData)) };
+            const D3D12_VERTEX_BUFFER_VIEW vertexViews[] = { mInstanceGeo->VertexBufferView(), instanceBufferView };
+            mCommandList->IASetVertexBuffers(0, _countof(vertexViews), vertexViews);
+            mCommandList->IASetIndexBuffer(&mInstanceGeo->IndexBufferView());
+            mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            const auto& cube = mInstanceGeo->DrawArgs.at("cube");
+            mCommandList->DrawIndexedInstanced(cube.IndexCount, mVisibleInstanceCount, cube.StartIndexLocation, cube.BaseVertexLocation, 0);
+        }
+    }
+    mShadowMap.Transition(mCommandList.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+}
+
 void SponzaApp::BuildTextures()
 {
     const auto& materials = mSponza->GetMaterials();
@@ -1177,6 +1336,17 @@ void SponzaApp::BuildGBuffer()
     mDeferredReady = true;
 }
 
+void SponzaApp::BuildShadowMap()
+{
+    mShadowMap.Build(md3dDevice.Get());
+    mShadowSrvStart = mGBufferSrvStart + GBuffer::TargetCount;
+    CD3DX12_CPU_DESCRIPTOR_HANDLE cpu(mCbvHeap->GetCPUDescriptorHandleForHeapStart());
+    cpu.Offset(mShadowSrvStart, mCbvSrvUavDescriptorSize);
+    CD3DX12_GPU_DESCRIPTOR_HANDLE gpu(mCbvHeap->GetGPUDescriptorHandleForHeapStart());
+    gpu.Offset(mShadowSrvStart, mCbvSrvUavDescriptorSize);
+    mShadowMap.CreateDescriptors(md3dDevice.Get(), cpu, gpu);
+}
+
 void SponzaApp::BuildPSO()
 {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
@@ -1207,6 +1377,28 @@ void SponzaApp::BuildPSO()
     instanceDesc.DS = { nullptr, 0 };
     instanceDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&instanceDesc, IID_PPV_ARGS(&mInstancePSO)));
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC shadowDesc = {};
+    shadowDesc.InputLayout = { mInputLayout.data(), static_cast<UINT>(mInputLayout.size()) };
+    shadowDesc.pRootSignature = mRootSignature.Get();
+    shadowDesc.VS = { reinterpret_cast<BYTE*>(mShadowVS->GetBufferPointer()), mShadowVS->GetBufferSize() };
+    shadowDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+    shadowDesc.RasterizerState.DepthBias = 1000;
+    shadowDesc.RasterizerState.SlopeScaledDepthBias = 1.5f;
+    shadowDesc.RasterizerState.DepthBiasClamp = 0.01f;
+    shadowDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+    shadowDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+    shadowDesc.SampleMask = UINT_MAX;
+    shadowDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    shadowDesc.NumRenderTargets = 0;
+    shadowDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    shadowDesc.SampleDesc.Count = 1;
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&shadowDesc, IID_PPV_ARGS(&mShadowPSO)));
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC shadowInstanceDesc = shadowDesc;
+    shadowInstanceDesc.InputLayout = { mInstanceInputLayout.data(), static_cast<UINT>(mInstanceInputLayout.size()) };
+    shadowInstanceDesc.VS = { reinterpret_cast<BYTE*>(mShadowInstanceVS->GetBufferPointer()), mShadowInstanceVS->GetBufferSize() };
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&shadowInstanceDesc, IID_PPV_ARGS(&mShadowInstancePSO)));
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC lightingDesc = psoDesc;
     lightingDesc.InputLayout = { nullptr, 0 };
