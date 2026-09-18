@@ -1,5 +1,5 @@
 cbuffer cbLights : register(b2) { float4 gCamera; float4 gAmbient; float4 gDir; float4 gDirColor; float4 gPointPosRange; float4 gPointColor; float4 gSpotPosRange; float4 gSpotDirPower; float4 gSpotColor; };
-Texture2D<float4> gAlbedoSpec : register(t1); Texture2D<float4> gWorldPos : register(t2); Texture2D<float4> gNormals : register(t3);
+Texture2D<float4> gAlbedoSpec : register(t3); Texture2D<float4> gWorldPos : register(t4); Texture2D<float4> gNormals : register(t5);
 struct VSOut { float4 Pos:SV_POSITION; };
 VSOut VS(uint id:SV_VertexID) { float2 uv=float2((id<<1)&2,id&2); VSOut o; o.Pos=float4(uv*float2(2,-2)+float2(-1,1),0,1); return o; }
 float3 Evaluate(float3 N,float3 V,float3 P,float3 L,float3 color,float intensity,float range,float cone) { float d=length(L); float3 l=L/max(d,0.001); float ndl=saturate(dot(N,l)); float att=range>0 ? saturate(1-d/range) : 1; float3 h=normalize(l+V); return color*intensity*att*(ndl+0.15*pow(saturate(dot(N,h)),32)); }

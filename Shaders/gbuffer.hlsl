@@ -1,8 +1,13 @@
-cbuffer cbObject : register(b0) { float4x4 gWorldViewProj; float4x4 gWorld; };
+cbuffer cbObject : register(b0) { float4x4 gWorldViewProj; float4x4 gWorld; float4 gCameraPosition; };
 cbuffer cbMaterial : register(b1) { float4 gDiffuse; float4 gSpecular; float4 gAmbient; float4 gEmissive; float4 gUV; float4 gFlags; };
-Texture2D gDiffuseMap : register(t0); SamplerState gSampler : register(s0);
-struct VSIn { float3 Pos : POSITION; float3 Normal : NORMAL; float2 UV : TEXCOORD; };
-struct VSOut { float4 Pos : SV_POSITION; float3 WorldPos : POSITION; float3 Normal : NORMAL; float2 UV : TEXCOORD; };
-VSOut VS(VSIn v) { VSOut o; o.Pos=mul(float4(v.Pos,1),gWorldViewProj); o.WorldPos=mul(float4(v.Pos,1),gWorld).xyz; o.Normal=normalize(mul(v.Normal,(float3x3)gWorld)); o.UV=v.UV*gUV.xy+gUV.zw; return o; }
-struct GBufferOut { float4 AlbedoSpec : SV_Target0; float4 WorldPos : SV_Target1; float4 Normal : SV_Target2; };
-GBufferOut PS(VSOut p) { GBufferOut o; float3 albedo=gDiffuse.rgb; if(gFlags.x>0.5) albedo*=gDiffuseMap.Sample(gSampler,p.UV).rgb; o.AlbedoSpec=float4(albedo, max(gSpecular.w,1)); o.WorldPos=float4(p.WorldPos,1); o.Normal=float4(normalize(p.Normal),1); return o; }
+Texture2D gDiffuseMap : register(t0); Texture2D gNormalMap : register(t1); Texture2D gDisplacementMap : register(t2); SamplerState gSampler : register(s0);
+struct VSIn { float3 Pos:POSITION; float3 Normal:NORMAL; float2 UV:TEXCOORD; float3 Tangent:TANGENT; };
+struct ControlPoint { float3 WorldPos:POSITION; float3 Normal:NORMAL; float3 Tangent:TANGENT; float2 UV:TEXCOORD; };
+struct PixelInput { float4 Pos:SV_POSITION; float3 WorldPos:POSITION; float3 Normal:NORMAL; float3 Tangent:TANGENT; float2 UV:TEXCOORD; };
+ControlPoint VS(VSIn v) { ControlPoint o; o.WorldPos=mul(float4(v.Pos,1),gWorld).xyz; o.Normal=normalize(mul(v.Normal,(float3x3)gWorld)); o.Tangent=normalize(mul(v.Tangent,(float3x3)gWorld)); o.UV=v.UV*gUV.xy+gUV.zw; return o; }
+struct TessFactors { float Edges[3]:SV_TessFactor; float Inside:SV_InsideTessFactor; };
+TessFactors HSConstants(InputPatch<ControlPoint,3> p,uint id:SV_PrimitiveID) { TessFactors f; float3 c=(p[0].WorldPos+p[1].WorldPos+p[2].WorldPos)/3; float t=lerp(8.0,1.0,saturate(distance(c,gCameraPosition.xyz)/80.0)); f.Edges[0]=f.Edges[1]=f.Edges[2]=t; f.Inside=t; return f; }
+[domain("tri")][partitioning("fractional_odd")][outputtopology("triangle_cw")][outputcontrolpoints(3)][patchconstantfunc("HSConstants")][maxtessfactor(8.0)] ControlPoint HS(InputPatch<ControlPoint,3> p,uint id:SV_OutputControlPointID) { return p[id]; }
+[domain("tri")] PixelInput DS(TessFactors f,float3 b:SV_DomainLocation,const OutputPatch<ControlPoint,3> p) { PixelInput o; o.WorldPos=b.x*p[0].WorldPos+b.y*p[1].WorldPos+b.z*p[2].WorldPos; o.Normal=normalize(b.x*p[0].Normal+b.y*p[1].Normal+b.z*p[2].Normal); o.Tangent=normalize(b.x*p[0].Tangent+b.y*p[1].Tangent+b.z*p[2].Tangent); o.UV=b.x*p[0].UV+b.y*p[1].UV+b.z*p[2].UV; if(gFlags.w>0.5) o.WorldPos+=o.Normal*((gDisplacementMap.SampleLevel(gSampler,o.UV,0).r-0.5)*0.35); o.Pos=mul(float4(o.WorldPos,1),gWorldViewProj); return o; }
+struct GBufferOut { float4 AlbedoSpec:SV_Target0; float4 WorldPos:SV_Target1; float4 Normal:SV_Target2; };
+GBufferOut PS(PixelInput p) { GBufferOut o; float3 a=gDiffuse.rgb; if(gFlags.x>0.5) a*=gDiffuseMap.Sample(gSampler,p.UV).rgb; float3 n=normalize(p.Normal); if(gFlags.z>0.5) { float3 t=normalize(p.Tangent-dot(p.Tangent,n)*n); float3 b=cross(n,t); float3 m=normalize(gNormalMap.Sample(gSampler,p.UV).xyz*2-1); n=normalize(m.x*t+m.y*b+m.z*n); } o.AlbedoSpec=float4(a,max(gSpecular.w,1)); o.WorldPos=float4(p.WorldPos,1); o.Normal=float4(n,1); return o; }

@@ -185,6 +185,32 @@ bool Model::LoadFromOBJ(const std::string& filename)
             ModelMesh& mesh = pair.second;
             if (!mesh.Indices.empty())
             {
+                std::vector<XMFLOAT3> tangents(mesh.Vertices.size(), XMFLOAT3(0, 0, 0));
+                for (size_t i = 0; i + 2 < mesh.Indices.size(); i += 3)
+                {
+                    auto& a = mesh.Vertices[mesh.Indices[i]];
+                    auto& b = mesh.Vertices[mesh.Indices[i + 1]];
+                    auto& c = mesh.Vertices[mesh.Indices[i + 2]];
+                    XMVECTOR e1 = XMLoadFloat3(&b.Position) - XMLoadFloat3(&a.Position);
+                    XMVECTOR e2 = XMLoadFloat3(&c.Position) - XMLoadFloat3(&a.Position);
+                    float du1 = b.TexCoord.x - a.TexCoord.x, dv1 = b.TexCoord.y - a.TexCoord.y;
+                    float du2 = c.TexCoord.x - a.TexCoord.x, dv2 = c.TexCoord.y - a.TexCoord.y;
+                    float det = du1 * dv2 - du2 * dv1;
+                    if (fabsf(det) < 1e-6f) continue;
+                    XMVECTOR tangent = (dv2 * e1 - dv1 * e2) * (1.0f / det);
+                    for (int k = 0; k < 3; ++k)
+                    {
+                        XMVECTOR total = XMLoadFloat3(&tangents[mesh.Indices[i + k]]) + tangent;
+                        XMStoreFloat3(&tangents[mesh.Indices[i + k]], total);
+                    }
+                }
+                for (size_t i = 0; i < mesh.Vertices.size(); ++i)
+                {
+                    XMVECTOR n = XMLoadFloat3(&mesh.Vertices[i].Normal);
+                    XMVECTOR t = XMLoadFloat3(&tangents[i]);
+                    t = XMVector3Normalize(t - XMVector3Dot(t, n) * n);
+                    if (XMVectorGetX(XMVector3LengthSq(t)) > 0.0f) XMStoreFloat3(&mesh.Vertices[i].Tangent, t);
+                }
                 mesh.IndexCount = static_cast<UINT>(mesh.Indices.size());
                 mMeshes.push_back(std::move(mesh));
             }

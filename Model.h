@@ -10,6 +10,7 @@ struct ModelVertex
     DirectX::XMFLOAT3 Position = { 0.0f, 0.0f, 0.0f };
     DirectX::XMFLOAT3 Normal = { 0.0f, 1.0f, 0.0f };
     DirectX::XMFLOAT2 TexCoord = { 0.0f, 0.0f };
+    DirectX::XMFLOAT3 Tangent = { 1.0f, 0.0f, 0.0f };
 };
 
 struct ModelMaterial
