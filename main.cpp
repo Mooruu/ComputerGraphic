@@ -3,6 +3,8 @@
 #include "Common/UploadBuffer.h"
 #include "Common/Camera.h"
 #include "Common/DDSTextureLoader.h"
+#include "Common/GeometryGenerator.h"
+#include "Culling.h"
 #include "GBuffer.h"
 #include "Model.h"
 #include "RenderingSystem.h"
@@ -12,6 +14,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <random>
 
 #pragma comment(lib, "windowscodecs.lib")
 
@@ -35,6 +38,12 @@ struct MaterialRootConstants
     DirectX::XMFLOAT4 UVTilingOffset = { 1.0f, 1.0f, 0.0f, 0.0f };
     // x = has diffuse texture, y = has specular texture, z = has normal texture.
     DirectX::XMFLOAT4 Flags = { 0.0f, 0.0f, 0.0f, 0.0f };
+};
+
+struct InstanceData
+{
+    DirectX::XMFLOAT4X4 World = MathHelper::Identity4x4();
+    DirectX::XMFLOAT4 Color = { 1.0f, 1.0f, 1.0f, 1.0f };
 };
 
 namespace
@@ -391,6 +400,9 @@ private:
     void BuildTextures();
     void BuildGBuffer();
     void BuildPSO();
+    void BuildInstancedScene();
+    void UpdateVisibleInstances();
+    void UpdateCullingMode();
 
 private:
     ComPtr<ID3D12RootSignature> mRootSignature = nullptr;
@@ -399,9 +411,18 @@ private:
 
     std::unique_ptr<UploadBuffer<ObjectConstants>> mObjectCB = nullptr;
     std::unique_ptr<UploadBuffer<DeferredLightConstants>> mLightCB = nullptr;
+    std::unique_ptr<UploadBuffer<InstanceData>> mInstanceBuffer = nullptr;
     std::unique_ptr<Model> mSponza = nullptr;
     std::unique_ptr<MeshGeometry> mSponzaGeo = nullptr;
     std::vector<Texture> mTextures;
+    std::unique_ptr<MeshGeometry> mInstanceGeo = nullptr;
+    std::vector<InstanceData> mInstances;
+    std::vector<SceneBounds> mInstanceBounds;
+    std::vector<UINT> mVisibleInstanceIndices;
+    Octree mInstanceOctree;
+    UINT mVisibleInstanceCount = 0;
+    bool mFrustumCullingEnabled = true;
+    bool mUseOctree = true;
     GBuffer mGBuffer;
     RenderingSystem mRenderingSystem;
     UINT mGBufferSrvStart = 0;
@@ -415,9 +436,13 @@ private:
     ComPtr<ID3DBlob> mGBufferDS = nullptr;
     ComPtr<ID3DBlob> mLightingVS = nullptr;
     ComPtr<ID3DBlob> mLightingPS = nullptr;
+    ComPtr<ID3DBlob> mInstanceVS = nullptr;
+    ComPtr<ID3DBlob> mInstancePS = nullptr;
     std::vector<D3D12_INPUT_ELEMENT_DESC> mInputLayout;
+    std::vector<D3D12_INPUT_ELEMENT_DESC> mInstanceInputLayout;
     ComPtr<ID3D12PipelineState> mPSO = nullptr;
     ComPtr<ID3D12PipelineState> mLightingPSO = nullptr;
+    ComPtr<ID3D12PipelineState> mInstancePSO = nullptr;
 
     XMFLOAT4X4 mWorld = MathHelper::Identity4x4();
 
@@ -453,7 +478,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance, PSTR cmdLine, in
 
 SponzaApp::SponzaApp(HINSTANCE hInstance) : D3DApp(hInstance)
 {
-    mMainWndCaption = L"Sponza Deferred - WASD move, Q/E up/down, mouse look, 1-6 texture controls";
+    mMainWndCaption = L"Sponza Deferred - WASD move, Q/E up/down, mouse look, F1/F2/F3 culling modes";
     mClientWidth = 1280;
     mClientHeight = 720;
 
@@ -482,6 +507,7 @@ bool SponzaApp::Initialize()
     BuildRootSignature();
     BuildShadersAndInputLayout();
     BuildModel();
+    BuildInstancedScene();
     BuildDescriptorHeaps();
     BuildConstantBuffers();
     BuildTextures();
@@ -508,6 +534,8 @@ void SponzaApp::Update(const GameTimer& gt)
 {
     OnKeyboardInput(gt);
     mCamera.UpdateViewMatrix();
+    UpdateCullingMode();
+    UpdateVisibleInstances();
 
     XMMATRIX world = XMLoadFloat4x4(&mWorld);
     XMMATRIX view = mCamera.GetView();
@@ -608,6 +636,30 @@ void SponzaApp::Draw(const GameTimer& gt)
                 submesh.BaseVertexLocation,
                 0);
         }
+    }
+
+    if (mInstanceGeo && mInstanceBuffer && mVisibleInstanceCount > 0)
+    {
+        mCommandList->SetPipelineState(mInstancePSO.Get());
+        const D3D12_VERTEX_BUFFER_VIEW instanceBufferView = {
+            mInstanceBuffer->Resource()->GetGPUVirtualAddress(),
+            mVisibleInstanceCount * static_cast<UINT>(sizeof(InstanceData)),
+            static_cast<UINT>(sizeof(InstanceData)) };
+        const D3D12_VERTEX_BUFFER_VIEW vertexViews[] = {
+            mInstanceGeo->VertexBufferView(), instanceBufferView };
+        mCommandList->IASetVertexBuffers(0, _countof(vertexViews), vertexViews);
+        mCommandList->IASetIndexBuffer(&mInstanceGeo->IndexBufferView());
+        mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+        MaterialRootConstants instanceMaterial;
+        instanceMaterial.DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+        instanceMaterial.SpecularAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 24.0f);
+        mCommandList->SetGraphicsRoot32BitConstants(
+            2, sizeof(MaterialRootConstants) / sizeof(UINT32), &instanceMaterial, 0);
+
+        const auto& cube = mInstanceGeo->DrawArgs.at("cube");
+        mCommandList->DrawIndexedInstanced(
+            cube.IndexCount, mVisibleInstanceCount, cube.StartIndexLocation, cube.BaseVertexLocation, 0);
     }
 
     mGBuffer.Transition(mCommandList.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -852,6 +904,12 @@ void SponzaApp::BuildShadersAndInputLayout()
         L"..\\..\\Shaders\\deferred_lighting.hlsl",
         L"deferred_lighting.hlsl"
     });
+    const std::wstring instancePath = FindExistingFileW({
+        L"Shaders\\instances.hlsl",
+        L"..\\Shaders\\instances.hlsl",
+        L"..\\..\\Shaders\\instances.hlsl",
+        L"instances.hlsl"
+    });
 
     mGBufferVS = d3dUtil::CompileShader(gbufferPath, nullptr, "VS", "vs_5_0");
     mGBufferPS = d3dUtil::CompileShader(gbufferPath, nullptr, "PS", "ps_5_0");
@@ -859,6 +917,8 @@ void SponzaApp::BuildShadersAndInputLayout()
     mGBufferDS = d3dUtil::CompileShader(gbufferPath, nullptr, "DS", "ds_5_0");
     mLightingVS = d3dUtil::CompileShader(lightingPath, nullptr, "VS", "vs_5_0");
     mLightingPS = d3dUtil::CompileShader(lightingPath, nullptr, "PS", "ps_5_0");
+    mInstanceVS = d3dUtil::CompileShader(instancePath, nullptr, "VS", "vs_5_0");
+    mInstancePS = d3dUtil::CompileShader(instancePath, nullptr, "PS", "ps_5_0");
 
     OutputDebugString(L"Shaders compiled successfully!\n");
 
@@ -869,6 +929,13 @@ void SponzaApp::BuildShadersAndInputLayout()
         { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
         { "TANGENT", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 32, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
     };
+
+    mInstanceInputLayout = mInputLayout;
+    mInstanceInputLayout.push_back({ "TEXCOORD", 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 });
+    mInstanceInputLayout.push_back({ "TEXCOORD", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 16, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 });
+    mInstanceInputLayout.push_back({ "TEXCOORD", 3, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 32, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 });
+    mInstanceInputLayout.push_back({ "TEXCOORD", 4, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 48, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 });
+    mInstanceInputLayout.push_back({ "TEXCOORD", 5, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 64, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 });
 }
 
 void SponzaApp::BuildModel()
@@ -893,6 +960,109 @@ void SponzaApp::BuildModel()
     mSponzaGeo = mSponza->GetMeshGeometry();
 
     OutputDebugString(L"Model loaded successfully!\n");
+}
+
+void SponzaApp::BuildInstancedScene()
+{
+    constexpr UINT gridSize = 64;
+    constexpr UINT instanceCount = gridSize * gridSize;
+
+    GeometryGenerator generator;
+    const auto cube = generator.CreateBox(1.5f, 1.5f, 1.5f, 0);
+    std::vector<ModelVertex> vertices;
+    vertices.reserve(cube.Vertices.size());
+    for (const auto& vertex : cube.Vertices)
+        vertices.push_back({ vertex.Position, vertex.Normal, vertex.TexC, vertex.TangentU });
+
+    mInstanceGeo = std::make_unique<MeshGeometry>();
+    mInstanceGeo->Name = "cullingInstanceCube";
+    const UINT vertexBytes = static_cast<UINT>(vertices.size() * sizeof(ModelVertex));
+    const UINT indexBytes = static_cast<UINT>(cube.Indices32.size() * sizeof(std::uint32_t));
+    mInstanceGeo->VertexBufferGPU = d3dUtil::CreateDefaultBuffer(md3dDevice.Get(), mCommandList.Get(),
+        vertices.data(), vertexBytes, mInstanceGeo->VertexBufferUploader);
+    mInstanceGeo->IndexBufferGPU = d3dUtil::CreateDefaultBuffer(md3dDevice.Get(), mCommandList.Get(),
+        cube.Indices32.data(), indexBytes, mInstanceGeo->IndexBufferUploader);
+    mInstanceGeo->VertexByteStride = sizeof(ModelVertex);
+    mInstanceGeo->VertexBufferByteSize = vertexBytes;
+    mInstanceGeo->IndexFormat = DXGI_FORMAT_R32_UINT;
+    mInstanceGeo->IndexBufferByteSize = indexBytes;
+    mInstanceGeo->DrawArgs["cube"] = { static_cast<UINT>(cube.Indices32.size()), 0, 0 };
+
+    mInstances.resize(instanceCount);
+    mInstanceBounds.resize(instanceCount);
+    std::mt19937 random(20260918);
+    std::uniform_real_distribution<float> color(0.35f, 1.0f);
+    std::uniform_real_distribution<float> height(0.7f, 2.3f);
+
+    for (UINT z = 0; z < gridSize; ++z)
+    {
+        for (UINT x = 0; x < gridSize; ++x)
+        {
+            const UINT index = z * gridSize + x;
+            const float worldX = (static_cast<float>(x) - 31.5f) * 5.0f;
+            const float worldZ = (static_cast<float>(z) - 31.5f) * 5.0f;
+            const float scaleY = height(random);
+            XMMATRIX world = XMMatrixScaling(1.0f, scaleY, 1.0f) * XMMatrixTranslation(worldX, 0.75f * scaleY, worldZ);
+            XMStoreFloat4x4(&mInstances[index].World, world);
+            mInstances[index].Color = XMFLOAT4(color(random), color(random), color(random), 1.0f);
+            mInstanceBounds[index].Center = XMFLOAT3(worldX, 0.75f * scaleY, worldZ);
+            mInstanceBounds[index].Extents = XMFLOAT3(0.75f, 0.75f * scaleY, 0.75f);
+        }
+    }
+
+    mInstanceBuffer = std::make_unique<UploadBuffer<InstanceData>>(md3dDevice.Get(), instanceCount, false);
+    mInstanceOctree.Build(mInstanceBounds, { XMFLOAT3(0.0f, 4.0f, 0.0f), XMFLOAT3(170.0f, 12.0f, 170.0f) });
+}
+
+void SponzaApp::UpdateCullingMode()
+{
+    if (GetAsyncKeyState(VK_F1) & 0x1)
+    {
+        mFrustumCullingEnabled = false;
+        SetWindowText(mhMainWnd, L"Sponza Deferred - F1: culling OFF");
+    }
+    if (GetAsyncKeyState(VK_F2) & 0x1)
+    {
+        mFrustumCullingEnabled = true;
+        mUseOctree = false;
+        SetWindowText(mhMainWnd, L"Sponza Deferred - F2: direct frustum culling");
+    }
+    if (GetAsyncKeyState(VK_F3) & 0x1)
+    {
+        mFrustumCullingEnabled = true;
+        mUseOctree = true;
+        SetWindowText(mhMainWnd, L"Sponza Deferred - F3: octree frustum culling");
+    }
+}
+
+void SponzaApp::UpdateVisibleInstances()
+{
+    if (!mInstanceBuffer)
+        return;
+
+    mVisibleInstanceIndices.clear();
+    if (!mFrustumCullingEnabled)
+    {
+        mVisibleInstanceIndices.resize(static_cast<UINT>(mInstances.size()));
+        for (UINT i = 0; i < mVisibleInstanceIndices.size(); ++i)
+            mVisibleInstanceIndices[i] = i;
+    }
+    else if (mUseOctree)
+    {
+        mInstanceOctree.QueryVisible(mCamera.GetView(), mCamera.GetProj(), mVisibleInstanceIndices);
+    }
+    else
+    {
+        for (UINT i = 0; i < mInstanceBounds.size(); ++i)
+        {
+            if (FrustumCuller::IsVisible(mInstanceBounds[i], mCamera.GetView(), mCamera.GetProj()))
+                mVisibleInstanceIndices.push_back(i);
+        }
+    }
+
+    mVisibleInstanceCount = static_cast<UINT>(mVisibleInstanceIndices.size());
+    for (UINT i = 0; i < mVisibleInstanceCount; ++i)
+        mInstanceBuffer->CopyData(i, mInstances[mVisibleInstanceIndices[i]]);
 }
 
 void SponzaApp::BuildTextures()
@@ -1028,6 +1198,15 @@ void SponzaApp::BuildPSO()
     psoDesc.DSVFormat = mDepthStencilFormat;
 
     ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&mPSO)));
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC instanceDesc = psoDesc;
+    instanceDesc.InputLayout = { mInstanceInputLayout.data(), static_cast<UINT>(mInstanceInputLayout.size()) };
+    instanceDesc.VS = { reinterpret_cast<BYTE*>(mInstanceVS->GetBufferPointer()), mInstanceVS->GetBufferSize() };
+    instanceDesc.PS = { reinterpret_cast<BYTE*>(mInstancePS->GetBufferPointer()), mInstancePS->GetBufferSize() };
+    instanceDesc.HS = { nullptr, 0 };
+    instanceDesc.DS = { nullptr, 0 };
+    instanceDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&instanceDesc, IID_PPV_ARGS(&mInstancePSO)));
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC lightingDesc = psoDesc;
     lightingDesc.InputLayout = { nullptr, 0 };

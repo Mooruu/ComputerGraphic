@@ -8,6 +8,7 @@
     <ClCompile Include="Common\GameTimer.cpp" />
     <ClCompile Include="Common\GeometryGenerator.cpp" />
     <ClCompile Include="Common\MathHelper.cpp" />
+    <ClCompile Include="Culling.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="Model.cpp" />
   </ItemGroup>
@@ -21,6 +22,7 @@
     <ClInclude Include="Common\GeometryGenerator.h" />
     <ClInclude Include="Common\MathHelper.h" />
     <ClInclude Include="Common\UploadBuffer.h" />
+    <ClInclude Include="Culling.h" />
     <ClInclude Include="Model.h" />
     <ClInclude Include="tiny_obj_loader.h" />
   </ItemGroup>
